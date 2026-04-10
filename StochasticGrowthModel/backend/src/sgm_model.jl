@@ -60,8 +60,8 @@ function output(kv::Float64, zv::Float64, α::Float64)
     return yv
 end
 
-@inline function muc(c::Float64, γ::Float64)
-    return c^(-γ)
+@inline function muc(c::Float64, σ::Float64)
+    return c^(-σ)
 end
 
 function Eval_muc!(muc, gk, kgrid, zgrid, Pz,
@@ -92,7 +92,7 @@ function Eval_muc!(muc, gk, kgrid, zgrid, Pz,
         cpv  = (1.0 - δ) * kvp + ypv - kp2
 
         if cpv > 0.0
-            mucp = muc(cpv, γ)
+            mucp = muc(cpv, σ)
             Rp  = 1.0 - δ + α * zpv * kvp^(α - 1.0)
             Ev_term += prob * mucp * Rp
         end
@@ -161,14 +161,14 @@ function euler_iter!(gw::GrowthCUDA)
         Nk, Nz
     )
 end
-
 function opt_policy!(gk, gc, k_endo, c_endo,
                      kgrid, zgrid,
                      α::Float64, δ::Float64,
-                     Nk::Int, Nz::Int)
+                     Nk::Int, Nz::Int,
+                     σk::Float64, τ::Float64)
 
-    jk = (blockIdx().x - 1) * blockDim().x + threadIdx().x  # current k
-    jz = (blockIdx().y - 1) * blockDim().y + threadIdx().y  # current z
+    jk = (blockIdx().x - 1) * blockDim().x + threadIdx().x  # current k index
+    jz = (blockIdx().y - 1) * blockDim().y + threadIdx().y  # current z index
 
     if jk > Nk || jz > Nz
         return
@@ -177,21 +177,26 @@ function opt_policy!(gk, gc, k_endo, c_endo,
     kv = kgrid[jk]
     zv = zgrid[jz]
 
-    jap_star = get_jkp(k_endo, kv, jz, Nk)
+    # 1. nearest endogenous index and neighborhood around it
+    j0, idxs = get_neighborhood_indices(k_endo, kv, jz, Nk; halfwidth = 1)
 
-    cv_star = c_endo[jap_star, jz]
+    # 2. softmax weights over these neighbors based on distance in k_endo
+    weights = zeros(Float64, length(idxs))
+    local_softmax_from_k!(weights, k_endo, idxs, kv, jz, σk, τ)
 
-    # budget: c_t = (1-δ)k + z k^α - k′
+    # 3. smoothed consumption at (k, z)
+    cv = smooth_c_from_neighbors(c_endo, idxs, jz, weights)
+
+    # 4. implied k' from budget: c = (1-δ)k + z k^α - k'
     yv  = output(kv, zv, α)
-    kvp = (1.0 - δ) * kv + yv - cv_star
+    kpv = (1.0 - δ) * kv + yv - cv
 
-    gc[jk, jz] = cv_star
-    gk[jk, jz] = kvp
+    gc[jk, jz] = cv
+    gk[jk, jz] = kpv
 
     return
 end
-
-function policy_iter!(gw::GrowthCUDA)
+function policy_iter!(gw::GrowthCUDA; σk::Float64, τ::Float64 = 1.0)
     Nk, Nz = gw.Nk, gw.Nz
     threads = (16, 16)
     blocks  = (cld(Nk, threads[1]), cld(Nz, threads[2]))
@@ -201,20 +206,25 @@ function policy_iter!(gw::GrowthCUDA)
         gw.k_endo, gw.c_endo,
         gw.kgrid, gw.zgrid,
         gw.α, gw.δ,
-        Nk, Nz
+        Nk, Nz,
+        σk, τ
     )
 end
 
 
-
-function egm_iter!(gw::GrowthCUDA)
+function egm_iter!(gw::GrowthCUDA; σk::Float64, τ::Float64)
     muc_iter!(gw)
     euler_iter!(gw)
-    policy_iter!(gw)
+    policy_iter!(gw; σk = σk, τ = τ)
 end
 
-function egm!(gw::GrowthCUDA; max_iter=500, tol=1e-7)
+function egm!(gw::GrowthCUDA; max_iter=500, tol=1e-7, τ=0.01, σ_mult=2.0)
     init_policy!(gw)
+
+    # one warmup EGM iteration to build an initial endogenous grid
+    muc_iter!(gw)
+    euler_iter!(gw)
+    σk = compute_sigma_k(gw; multiplier = σ_mult)
 
     dist = Inf
     it   = 0
@@ -224,7 +234,7 @@ function egm!(gw::GrowthCUDA; max_iter=500, tol=1e-7)
 
         gk_old = copy(gw.gk)
 
-        egm_iter!(gw)
+        egm_iter!(gw; σk = σk, τ = τ)
 
         dist = maximum(abs.(gw.gk .- gk_old))
 
