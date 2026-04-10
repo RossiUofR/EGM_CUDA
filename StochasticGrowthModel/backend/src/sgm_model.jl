@@ -164,8 +164,7 @@ end
 function opt_policy!(gk, gc, k_endo, c_endo,
                      kgrid, zgrid,
                      α::Float64, δ::Float64,
-                     Nk::Int, Nz::Int,
-                     σk::Float64, τ::Float64)
+                     Nk::Int, Nz::Int)
 
     jk = (blockIdx().x - 1) * blockDim().x + threadIdx().x  # current k index
     jz = (blockIdx().y - 1) * blockDim().y + threadIdx().y  # current z index
@@ -177,17 +176,13 @@ function opt_policy!(gk, gc, k_endo, c_endo,
     kv = kgrid[jk]
     zv = zgrid[jz]
 
-    # 1. nearest endogenous index and neighborhood around it
-    j0, idxs = get_neighborhood_indices(k_endo, kv, jz, Nk; halfwidth = 1)
+    # nearest endogenous index for this (k,z)
+    jap_star = get_jkp(k_endo, kv, jz, Nk)
 
-    # 2. softmax weights over these neighbors based on distance in k_endo
-    weights = zeros(Float64, length(idxs))
-    local_softmax_from_k!(weights, k_endo, idxs, kv, jz, σk, τ)
+    # consumption at nearest endogenous point
+    cv = c_endo[jap_star, jz]
 
-    # 3. smoothed consumption at (k, z)
-    cv = smooth_c_from_neighbors(c_endo, idxs, jz, weights)
-
-    # 4. implied k' from budget: c = (1-δ)k + z k^α - k'
+    # implied k' from budget: c = (1-δ)k + z k^α - k'
     yv  = output(kv, zv, α)
     kpv = (1.0 - δ) * kv + yv - cv
 
@@ -196,7 +191,7 @@ function opt_policy!(gk, gc, k_endo, c_endo,
 
     return
 end
-function policy_iter!(gw::GrowthCUDA; σk::Float64, τ::Float64 = 1.0)
+function policy_iter!(gw::GrowthCUDA)
     Nk, Nz = gw.Nk, gw.Nz
     threads = (16, 16)
     blocks  = (cld(Nk, threads[1]), cld(Nz, threads[2]))
@@ -206,25 +201,19 @@ function policy_iter!(gw::GrowthCUDA; σk::Float64, τ::Float64 = 1.0)
         gw.k_endo, gw.c_endo,
         gw.kgrid, gw.zgrid,
         gw.α, gw.δ,
-        Nk, Nz,
-        σk, τ
+        Nk, Nz
     )
 end
 
 
-function egm_iter!(gw::GrowthCUDA; σk::Float64, τ::Float64)
+function egm_iter!(gw::GrowthCUDA)
     muc_iter!(gw)
     euler_iter!(gw)
-    policy_iter!(gw; σk = σk, τ = τ)
+    policy_iter!(gw)
 end
 
-function egm!(gw::GrowthCUDA; max_iter=500, tol=1e-7, τ=0.01, σ_mult=2.0)
+function egm!(gw::GrowthCUDA; max_iter=500, tol=1e-7)
     init_policy!(gw)
-
-    # one warmup EGM iteration to build an initial endogenous grid
-    muc_iter!(gw)
-    euler_iter!(gw)
-    σk = compute_sigma_k(gw; multiplier = σ_mult)
 
     dist = Inf
     it   = 0
@@ -234,7 +223,7 @@ function egm!(gw::GrowthCUDA; max_iter=500, tol=1e-7, τ=0.01, σ_mult=2.0)
 
         gk_old = copy(gw.gk)
 
-        egm_iter!(gw; σk = σk, τ = τ)
+        egm_iter!(gw)
 
         dist = maximum(abs.(gw.gk .- gk_old))
 
