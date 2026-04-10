@@ -94,12 +94,20 @@ struct GrowthCPU
     Nk :: Int
     Nz :: Int
 
-    kgrid :: Vector{Float64}
-    zgrid :: Vector{Float64}
+    kgrid  :: Vector{Float64}
+    zgrid  :: Vector{Float64}
+    Pz     :: Matrix{Float64}
 
-    gk :: Matrix{Float64}
-    gc :: Matrix{Float64}
+    # Policies on fixed grid
+    gk     :: Matrix{Float64}
+    gc     :: Matrix{Float64}
+
+    # EGM work arrays
+    k_endo :: Matrix{Float64}
+    c_endo :: Matrix{Float64}
+    muc    :: Matrix{Float64}
 end
+
 
 function to_cpu(gw::GrowthCUDA)
     GrowthCPU(
@@ -107,33 +115,43 @@ function to_cpu(gw::GrowthCUDA)
         gw.Nk, gw.Nz,
         Array(gw.kgrid),
         Array(gw.zgrid),
+        Array(gw.Pz),
         Array(gw.gk),
         Array(gw.gc),
+        Array(gw.k_endo),
+        Array(gw.c_endo),
+        Array(gw.muc),
     )
 end
-
 # For given (k', z, c_t), find jk that makes budget-implied c closest to c_t
-function get_jk_from_cv(kgrid, zv::Float64, kvp::Float64,
-                        c_t::Float64, α::Float64, δ::Float64,
-                        Nk::Int)
-    best_jk = 1
-    kv     = kgrid[1]
-    yv     = output(kv, zv, α)
-    c_best = (1.0 - δ) * kv + yv - kvp
-    best_d = abs(c_best - c_t)
+@inline function get_k_from_cv(kgrid, zv::Float64, kvp::Float64,
+                               c_t::Float64, α::Float64, δ::Float64,
+                               Nk::Int)
+    kL = kgrid[1]
+    fL = (1.0 - δ) * kL + zv * kL^α - kvp - c_t
 
-    @inbounds for jk in 2:Nk
-        kv = kgrid[jk]
-        yv = output(kv, zv, α)
-        c_candidate = (1.0 - δ) * kv + yv - kvp
-        d = abs(c_candidate - c_t)
-        if d < best_d
-            best_d = d
-            best_jk = jk
-        end
+    if fL >= 0.0
+        return kL
     end
 
-    return best_jk
-end
+    @inbounds for jk in 2:Nk
+        kH = kgrid[jk]
+        fH = (1.0 - δ) * kH + zv * kH^α - kvp - c_t
 
+        if fL <= 0.0 && fH >= 0.0
+            if fH == fL
+                return kL
+            end
+
+            wH = -fL / (fH - fL)
+            wL = 1.0 - wH
+            return wL * kL + wH * kH
+        end
+
+        kL = kH
+        fL = fH
+    end
+
+    return kgrid[Nk]
+end
 

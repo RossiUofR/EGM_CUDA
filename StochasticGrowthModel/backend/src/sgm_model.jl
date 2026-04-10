@@ -1,4 +1,4 @@
-struct GrowthCUDA
+mutable struct GrowthCUDA
     β  :: Float64
     σ  :: Float64
     α  :: Float64
@@ -21,8 +21,8 @@ struct GrowthCUDA
     muc    :: CuMatrix{Float64}     # Nk × Nz, E[u_c(c_{t+1}) | k′, z]
 end
 
-function GrowthCUDA(; β=0.95, σ=2.0, α=0.3, δ=0.2,
-                    Nk=1000, Nz=10, kmin=0.1, kmax=10.0,
+function GrowthCUDA(; β=0.95, σ=1.0, α=0.3, δ=0.2,
+                    Nk=1500, Nz=15, kmin=0.1, kmax=2.0,
                     ρ=0.9, σϵ=0.02)
 
     # 1. CPU grids
@@ -60,10 +60,13 @@ function output(kv::Float64, zv::Float64, α::Float64)
     return yv
 end
 
-@inline function muc(c::Float64, σ::Float64)
-    return c^(-σ)
+@inline function muc_fun(c::Float64, σ::Float64)
+    if abs(σ - 1.0) < 1e-12
+        return 1.0 / c
+    else
+        return c^(-σ)
+    end
 end
-
 function Eval_muc!(muc, gk, kgrid, zgrid, Pz,
                    β::Float64, σ::Float64, α::Float64, δ::Float64,
                    Nk::Int, Nz::Int)
@@ -85,14 +88,14 @@ function Eval_muc!(muc, gk, kgrid, zgrid, Pz,
         zpv  = zgrid[jzp]
 
         # policy at (k′, z′): k″ = gk(k′, z′)
-        kp2  = gk[jkp, jzp]
+        kppv  = gk[jkp, jzp]
 
         # c_{t+1} from budget with state (k′, z′) and choice k″
         ypv  = output(kvp, zpv, α)
-        cpv  = (1.0 - δ) * kvp + ypv - kp2
+        cpv  = (1.0 - δ) * kvp + ypv - kppv
 
         if cpv > 0.0
-            mucp = muc(cpv, σ)
+            mucp = muc_fun(cpv, σ)
             Rp  = 1.0 - δ + α * zpv * kvp^(α - 1.0)
             Ev_term += prob * mucp * Rp
         end
@@ -118,8 +121,8 @@ function invert_euler!(k_endo, c_endo, muc, kgrid, zgrid,
                        β::Float64, σ::Float64, α::Float64, δ::Float64,
                        Nk::Int, Nz::Int)
 
-    jkp = (blockIdx().x - 1) * blockDim().x + threadIdx().x  # index for k′
-    jz  = (blockIdx().y - 1) * blockDim().y + threadIdx().y  # index for z
+    jkp = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    jz  = (blockIdx().y - 1) * blockDim().y + threadIdx().y
 
     if jkp > Nk || jz > Nz
         return
@@ -130,7 +133,7 @@ function invert_euler!(k_endo, c_endo, muc, kgrid, zgrid,
 
     Ev_muc = muc[jkp, jz]
 
-    # Euler inversion: current consumption
+    # Euler inversion
     cv = if Ev_muc <= 0.0
         1e-10
     else
@@ -139,9 +142,8 @@ function invert_euler!(k_endo, c_endo, muc, kgrid, zgrid,
         rhs^(-1.0 / σ)
     end
 
-    # Find best current k index on existing kgrid
-    jk_best = get_jk_from_cv(kgrid, zv, kvp, cv, α, δ, Nk)
-    kv_star = kgrid[jk_best]
+    # endogenous current k from budget equation
+    kv_star = get_k_from_cv(kgrid, zv, kvp, cv, α, δ, Nk)
 
     k_endo[jkp, jz] = kv_star
     c_endo[jkp, jz] = cv
@@ -177,10 +179,10 @@ function opt_policy!(gk, gc, k_endo, c_endo,
     zv = zgrid[jz]
 
     # nearest endogenous index for this (k,z)
-    jap_star = get_jkp(k_endo, kv, jz, Nk)
+    jkp_star = get_jkp(k_endo, kv, jz, Nk)
 
     # consumption at nearest endogenous point
-    cv = c_endo[jap_star, jz]
+    cv = c_endo[jkp_star, jz]
 
     # implied k' from budget: c = (1-δ)k + z k^α - k'
     yv  = output(kv, zv, α)
@@ -191,6 +193,9 @@ function opt_policy!(gk, gc, k_endo, c_endo,
 
     return
 end
+
+
+
 function policy_iter!(gw::GrowthCUDA)
     Nk, Nz = gw.Nk, gw.Nz
     threads = (16, 16)
@@ -212,23 +217,35 @@ function egm_iter!(gw::GrowthCUDA)
     policy_iter!(gw)
 end
 
-function egm!(gw::GrowthCUDA; max_iter=500, tol=1e-7)
+function egm!(gw::GrowthCUDA; max_iter=10000, tol=1e-7, λ=0.05)
     init_policy!(gw)
 
     dist = Inf
-    it   = 0
+    jt   = 0
 
-    while it < max_iter && dist > tol
-        it += 1
+    while jt < max_iter && dist > tol
+        jt += 1
 
+        # store old policies
         gk_old = copy(gw.gk)
+        gc_old = copy(gw.gc)
 
+        # one raw EGM update (overwrites gw.gk, gw.gc)
         egm_iter!(gw)
 
+        # raw new policies
+        gk_raw = copy(gw.gk)
+        gc_raw = copy(gw.gc)
+
+        # damped update
+        gw.gk .= (1.0 - λ) .* gk_old .+ λ .* gk_raw
+        gw.gc .= (1.0 - λ) .* gc_old .+ λ .* gc_raw
+
+        # convergence metric on capital policy
         dist = maximum(abs.(gw.gk .- gk_old))
 
-        if it % 10 == 0 || it == 1
-            println("EGM iter = $it, dist = $dist")
+        if jt % 30 == 0 || jt == 1
+            println("EGM iter = $jt, dist = $dist")
         end
     end
 
