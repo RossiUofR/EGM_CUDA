@@ -30,8 +30,8 @@ end
 
 function ConsSavEGMCUDA(; β = 0.975, R = 1.02, γ = 2.0,
                          ϕ = 0.0, ρ = 0.9, σ = 0.06,
-                         Na = 10000, amax = 10.0,
-                         Ny = 25, Nε = 5)
+                         Na = 1500, amax = 10.0,
+                         Ny = 10, Nε = 5)
 
     apgrid_cpu = get_log_agrid(Na, ϕ, amax)
 
@@ -92,7 +92,7 @@ function u(c::Float64, γ::Float64)
 end
 
 # marginal utility for CRRA
-@inline function muc(c::Float64, γ::Float64)
+@inline function muc_fun(c::Float64, γ::Float64)
     return c^(-γ)
 end
 
@@ -132,14 +132,10 @@ function Eval_muc!(muc, gc, apgrid, ygrid, εnodes, wε,
         # income tomorrow
         ypv = exp(ρ * yv_log + σ * εv)
 
-        # nearest income index tomorrow
-        jyp = get_jyp(ypv, ygrid, Ny)
-
-        # consumption tomorrow at (a', y')
-        c_star = gc[jap, jyp]
+       c_star = interp_y_from_nearest(gc, jap, ypv, ygrid, Ny)
 
         if c_star > 0.0
-            Ev_muc += wvε * muc(c_star, γ)
+            Ev_muc += wvε * muc_fun(c_star, γ)
         end
     end
 
@@ -182,41 +178,37 @@ Formulas:
   av = (c_t + a' - yv) / R
 """
 function invert_euler!(a_endo, c_endo, muc, apgrid, ygrid,
-                                 β::Float64, γ::Float64, R::Float64,
-                                 Na::Int, Ny::Int)
+                       β::Float64, γ::Float64, R::Float64,
+                       Na::Int, Ny::Int)
 
-    jap = (blockIdx().x - 1) * blockDim().x + threadIdx().x  # index for a'
-    jy  = (blockIdx().y - 1) * blockDim().y + threadIdx().y  # index for y today
+    jap = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    jy  = (blockIdx().y - 1) * blockDim().y + threadIdx().y
 
     if jap > Na || jy > Ny
         return
     end
 
-    # Grid values
-    apv = apgrid[jap]   # a' value (choice next period)
-    yv  = ygrid[jy]     # income today
+    apv = apgrid[jap]
+    yv  = ygrid[jy]
 
-    # Expected marginal utility at (a', yv)
     Ev_muc = muc[jap, jy]
 
-    # Guard: if Ev_muc is nonpositive or tiny, avoid NaNs
     if Ev_muc <= 0.0
         cv = 1e-10
     else
         rhs = β * R * Ev_muc
-        rhs = max(rhs, 1e-12)   # extra safety
+        rhs = max(rhs, 1e-12)
         cv = rhs^(-1.0 / γ)
     end
 
-    # Endogenous current asset that makes this (a', c) feasible
     av = (cv + apv - yv) / R
+
 
     c_endo[jap, jy] = cv
     a_endo[jap, jy] = av
 
     return
 end
-
 """
     euler_iter(cs)
 
@@ -251,37 +243,45 @@ Store:
   gc[ja, jy] = c(a,y)
   ga[ja, jy] = a'(a,y)
 """
-function opt_policy!(ga, gc, a_endo, c_endo,
-                                apgrid, ygrid,
-                                R::Float64,
-                                Na::Int, Ny::Int)
+function opt_policy!(ga, gc, a_endo, c_endo, apgrid, ygrid,
+                     R::Float64, Na::Int, Ny::Int)
 
-    ja = (blockIdx().x - 1) * blockDim().x + threadIdx().x  # index for current assets a
-    jy = (blockIdx().y - 1) * blockDim().y + threadIdx().y  # index for y today
+    ja = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    jy = (blockIdx().y - 1) * blockDim().y + threadIdx().y
 
     if ja > Na || jy > Ny
         return
     end
 
-    # current state (a, y)
     av = apgrid[ja]
     yv = ygrid[jy]
 
-    # search along endogenous a-grid for this yv
-    jap_star = get_jap(a_endo,av,jy)
+    # endogenous a-grid threshold for this y
+    a1 = a_endo[1, jy]   # lowest current-asset in endogenous grid at this y
 
-    # consumption at nearest endogenous point
-    cv = c_endo[jap_star, jy]
+    if av <= a1
+        # ---- borrowing constraint region: a' = 0 when ϕ = 0 ----
+        apv = 0.0
+        cv  = R * av + yv - apv   # c + a' = Ra + y
+    else
+        # ---- interior region: use EGM inversion as usual ----
+        jap_star = get_jap(a_endo, av, jy, Na)
 
-    # implied a' from budget constraint
-    apv = R * av + yv - cv
+        cv  = c_endo[jap_star, jy]
+        apv = R * av + yv - cv
+    end
+
+    # final safety clamp (handles tiny negatives)
+    if apv < 0.0
+        apv = 0.0
+        cv  = R * av + yv - apv
+    end
 
     gc[ja, jy] = cv
     ga[ja, jy] = apv
 
     return
 end
-
 """
     project_policy!(cs)
 
@@ -322,7 +322,7 @@ end
 
 
 """
-    init_policy_kernel!(ga, gc, apgrid, ygrid, ϕ, R, Na, Ny)
+    init_policy!(ga, gc, apgrid, ygrid, ϕ, R, Na, Ny)
 
 GPU kernel:
   For each (ja, jy), set
@@ -386,19 +386,31 @@ Solve the consumption-savings problem by EGM.
 Convergence is checked using the sup norm on the asset policy:
     max |ga_new - ga_old|
 """
-function egm!(cs::ConsSavEGMCUDA; max_iter = 100, tol = 1e-8)
+function egm!(cs::ConsSavEGMCUDA; max_iter = 15000, tol = 1e-7, λ = 0.05)
+    
     init_policy!(cs)
-
     diff = Inf
     jt   = 0
 
     while jt < max_iter && diff > tol
         jt += 1
-
+        # store old policies
         ga_old = copy(cs.ga)
+        gc_old = copy(cs.gc)
 
+        # one raw EGM update
         egm_iter!(cs)
 
+        # raw new policies produced by egm_iter!
+        ga_new = copy(cs.ga)
+        gc_new = copy(cs.gc)
+
+        # damped update:
+        # new iterate = λ * raw_update + (1-λ) * old_iterate
+        cs.ga .= λ .* ga_new .+ (1.0 - λ) .* ga_old
+        cs.gc .= λ .* gc_new .+ (1.0 - λ) .* gc_old
+
+        # convergence metric on asset policy
         diff = maximum(abs.(cs.ga .- ga_old))
 
         if jt % 10 == 0 || jt == 1
@@ -406,5 +418,5 @@ function egm!(cs::ConsSavEGMCUDA; max_iter = 100, tol = 1e-8)
         end
     end
 
-    return
+    return cs
 end

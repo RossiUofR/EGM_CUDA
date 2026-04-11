@@ -1,4 +1,4 @@
-mutable struct GrowthCUDA
+mutable struct GrowthCUDAEGM
     β  :: Float64
     σ  :: Float64
     α  :: Float64
@@ -21,7 +21,7 @@ mutable struct GrowthCUDA
     muc    :: CuMatrix{Float64}     # Nk × Nz, E[u_c(c_{t+1}) | k′, z]
 end
 
-function GrowthCUDA(; β=0.95, σ=1.0, α=0.3, δ=0.2,
+function GrowthCUDAEGM(; β=0.95, σ=1.0, α=0.3, δ=0.2,
                     Nk=1500, Nz=15, kmin=0.1, kmax=2.0,
                     ρ=0.9, σϵ=0.02)
 
@@ -42,7 +42,7 @@ function GrowthCUDA(; β=0.95, σ=1.0, α=0.3, δ=0.2,
     c_endo = CUDA.zeros(Float64, Nk, Nz)
     muc    = CUDA.zeros(Float64, Nk, Nz)
 
-    return GrowthCUDA(β, σ, α, δ,
+    return GrowthCUDAEGM(β, σ, α, δ,
                       Nk, Nz,
                       kgrid, zgrid, Pz,
                       gk, gc,
@@ -105,7 +105,7 @@ function Eval_muc!(muc, gk, kgrid, zgrid, Pz,
     return
 end
 
-function muc_iter!(gw::GrowthCUDA)
+function muc_iter!(gw::GrowthCUDAEGM)
     Nk, Nz = gw.Nk, gw.Nz
     threads = (16, 16)
     blocks  = (cld(Nk, threads[1]), cld(Nz, threads[2]))
@@ -151,7 +151,7 @@ function invert_euler!(k_endo, c_endo, muc, kgrid, zgrid,
     return
 end
 
-function euler_iter!(gw::GrowthCUDA)
+function euler_iter!(gw::GrowthCUDAEGM)
     Nk, Nz = gw.Nk, gw.Nz
     threads = (16, 16)
     blocks  = (cld(Nk, threads[1]), cld(Nz, threads[2]))
@@ -196,7 +196,7 @@ end
 
 
 
-function policy_iter!(gw::GrowthCUDA)
+function policy_iter!(gw::GrowthCUDAEGM)
     Nk, Nz = gw.Nk, gw.Nz
     threads = (16, 16)
     blocks  = (cld(Nk, threads[1]), cld(Nz, threads[2]))
@@ -211,13 +211,13 @@ function policy_iter!(gw::GrowthCUDA)
 end
 
 
-function egm_iter!(gw::GrowthCUDA)
+function egm_iter!(gw::GrowthCUDAEGM)
     muc_iter!(gw)
     euler_iter!(gw)
     policy_iter!(gw)
 end
 
-function egm!(gw::GrowthCUDA; max_iter=10000, tol=1e-7, λ=0.05)
+function egm!(gw::GrowthCUDAEGM; max_iter=10000, tol=1e-7, λ=0.05)
     init_policy!(gw)
 
     dist = Inf

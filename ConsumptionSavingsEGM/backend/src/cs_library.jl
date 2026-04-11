@@ -77,15 +77,16 @@ function make_quadrature(Nε::Int)
     return εnodes, wε
 end
 
-function init_policy!(cs::ConsSavCUDA)
+#=
+function init_policy!(cs::ConsSavEGMCUDA)
     Na, Ny = cs.Na, cs.Ny
     for ja in 1:Na, jy in 1:Ny
         cs.ga[ja, jy] = cs.agrid[ja]    # a' = a as a simple guess
     end
     return
 end
-
-struct ConsSavCPU
+=#
+struct ConsSavCPUEGM
     β  :: Float64
     γ  :: Float64
     R  :: Float64
@@ -97,28 +98,32 @@ struct ConsSavCPU
     Ny :: Int
     Nε :: Int
 
-    agrid :: Vector{Float64}
-    ygrid :: Vector{Float64}
+    apgrid :: Vector{Float64}
+    ygrid  :: Vector{Float64}
 
-    V  :: Matrix{Float64}
-    ga :: Matrix{Float64}
-    gc :: Matrix{Float64}
-
-    method :: Symbol
+    a_endo :: Matrix{Float64}
+    c_endo :: Matrix{Float64}
+    muc    :: Matrix{Float64}
+    ga     :: Matrix{Float64}
+    gc     :: Matrix{Float64}
+    V      :: Matrix{Float64}
 end
 
-function to_cpu(cs::ConsSavCUDA)
-    ConsSavCPU(
+function to_cpu(cs::ConsSavEGMCUDA)
+    ConsSavCPUEGM(
         cs.β, cs.γ, cs.R, cs.ϕ, cs.ρ, cs.σ,
         cs.Na, cs.Ny, cs.Nε,
-        Array(cs.agrid),
+        Array(cs.apgrid),
         Array(cs.ygrid),
-        Array(cs.V),
+        Array(cs.a_endo),
+        Array(cs.c_endo),
+        Array(cs.muc),
         Array(cs.ga),
         Array(cs.gc),
-        cs.method,
+        Array(cs.V),
     )
 end
+
 
 """
     get_jyp(ypv, ygrid, Ny)
@@ -142,9 +147,10 @@ Intended for use inside GPU kernels.
     return jyp_best
 end
 
-function get_jap(a_endo,av,jy)
+@inline function get_jap(a_endo, av::Float64, jy::Int, Na::Int)
     jap_best = 1
     dist_min = abs(a_endo[1, jy] - av)
+
     @inbounds for jap in 2:Na
         d = abs(a_endo[jap, jy] - av)
         if d < dist_min
@@ -152,5 +158,38 @@ function get_jap(a_endo,av,jy)
             jap_best = jap
         end
     end
-    return jap
+
+    return jap_best
+end
+
+@inline function interp_y_from_nearest(gc, jap::Int, ypv::Float64, ygrid, Ny::Int)
+    jyp = get_jyp(ypv, ygrid, Ny)
+
+    jL = jyp
+    jH = jyp
+
+    if ypv < ygrid[jyp] && jyp > 1
+        jL = jyp - 1
+        jH = jyp
+    elseif ypv > ygrid[jyp] && jyp < Ny
+        jL = jyp
+        jH = jyp + 1
+    end
+
+    if jL == jH
+        return gc[jap, jL]
+    end
+
+    yL = ygrid[jL]
+    yH = ygrid[jH]
+
+    if yH == yL
+        return gc[jap, jL]
+    end
+
+    wH = (ypv - yL) / (yH - yL)
+    wL = 1.0 - wH
+
+    c_star = wL * gc[jap, jL] + wH * gc[jap, jH]
+    return c_star
 end

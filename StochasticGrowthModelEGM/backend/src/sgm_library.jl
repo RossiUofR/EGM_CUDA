@@ -38,7 +38,7 @@ function fill_guess!(gk, gc, kgrid, zgrid,
     return
 end
 
-function init_policy!(gw::GrowthCUDA)
+function init_policy!(gw::GrowthCUDAEGM)
     Nk, Nz = gw.Nk, gw.Nz
     threads = (16, 16)
     blocks  = (cld(Nk, threads[1]), cld(Nz, threads[2]))
@@ -85,7 +85,7 @@ function tauchenlib(N::Int, ρ::Float64, σϵ::Float64; m::Float64 = 3.0)
     return zgrid, P
 end
 
-struct GrowthCPU
+struct GrowthCPUEGM
     β  :: Float64
     σ  :: Float64
     α  :: Float64
@@ -109,8 +109,8 @@ struct GrowthCPU
 end
 
 
-function to_cpu(gw::GrowthCUDA)
-    GrowthCPU(
+function to_cpu(gw::GrowthCUDAEGM)
+    GrowthCPUEGM(
         gw.β, gw.σ, gw.α, gw.δ,
         gw.Nk, gw.Nz,
         Array(gw.kgrid),
