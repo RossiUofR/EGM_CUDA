@@ -193,3 +193,42 @@ end
     c_star = wL * gc[jap, jL] + wH * gc[jap, jH]
     return c_star
 end
+
+@inline function interp_c_in_a(a_endo, c_endo,
+                               av::Float64, jy::Int, Na::Int,
+                               jap_nn::Int)
+    jap = max(1, min(Na, jap_nn))
+    a0  = a_endo[jap, jy]
+
+    # exact hit or only one point
+    if Na == 1 || av == a0
+        return c_endo[jap, jy]
+    end
+
+    # choose neighbor
+    if av > a0 && jap < Na
+        # bracket: [jap, jap+1]
+        jL = jap
+        jH = jap + 1
+    elseif av < a0 && jap > 1
+        # bracket: [jap-1, jap]
+        jL = jap - 1
+        jH = jap
+    else
+        # boundary → fall back to nearest
+        return c_endo[jap, jy]
+    end
+
+    aL = a_endo[jL, jy]
+    aH = a_endo[jH, jy]
+
+    if aH == aL
+        return c_endo[jL, jy]
+    end
+
+    # linear weights in a
+    wH = (av - aL) / (aH - aL)
+    wL = 1.0 - wH
+    cv = wL * c_endo[jL, jy] + wH * c_endo[jH, jy]
+    return cv
+end

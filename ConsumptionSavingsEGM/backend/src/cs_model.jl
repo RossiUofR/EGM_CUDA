@@ -266,9 +266,8 @@ function opt_policy!(ga, gc, a_endo, c_endo, apgrid, ygrid,
     else
         # ---- interior region: use EGM inversion as usual ----
         jap_star = get_jap(a_endo, av, jy, Na)
-
-        cv  = c_endo[jap_star, jy]
-        apv = R * av + yv - cv
+        cv     = interp_c_in_a(a_endo, c_endo, av, jy, Na, jap_star)
+        apv    = R * av + yv - cv
     end
 
     # final safety clamp (handles tiny negatives)
@@ -386,7 +385,7 @@ Solve the consumption-savings problem by EGM.
 Convergence is checked using the sup norm on the asset policy:
     max |ga_new - ga_old|
 """
-function egm!(cs::ConsSavEGMCUDA; max_iter = 15000, tol = 1e-7, λ = 0.05)
+function egm!(cs::ConsSavEGMCUDA; max_iter = 15000, tol = 1e-10, λ = 0.05)
     
     init_policy!(cs)
     diff = Inf
@@ -404,14 +403,14 @@ function egm!(cs::ConsSavEGMCUDA; max_iter = 15000, tol = 1e-7, λ = 0.05)
         # raw new policies produced by egm_iter!
         ga_new = copy(cs.ga)
         gc_new = copy(cs.gc)
+                # convergence metric on asset policy
+
+        diff = maximum(abs.(cs.ga .- ga_old))
 
         # damped update:
         # new iterate = λ * raw_update + (1-λ) * old_iterate
         cs.ga .= λ .* ga_new .+ (1.0 - λ) .* ga_old
         cs.gc .= λ .* gc_new .+ (1.0 - λ) .* gc_old
-
-        # convergence metric on asset policy
-        diff = maximum(abs.(cs.ga .- ga_old))
 
         if jt % 10 == 0 || jt == 1
             println("EGM iter = ", jt, ", dist = ", diff)
